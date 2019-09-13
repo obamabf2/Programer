@@ -1,0 +1,193 @@
+ALTER PROCEDURE [dbo].[WZ_ACCOUNT_LOGIN_EXEC]
+	@in_IP varchar(100),
+	@CustomerID int,
+	@in_Country varchar(50)='',
+	@in_IsSteamLogin int = 0
+AS
+BEGIN
+	SET NOCOUNT ON;
+	
+	--
+	-- helper function that perform actual user login
+	--
+	
+	-- Account.AccountStatus - used for account lock
+	declare @AccAccountStatus int = 0
+	select @AccAccountStatus=AccountStatus from Accounts where CustomerID=@CustomerID
+	
+	-- UsersData data
+	declare @IsDeveloper int = 0
+	declare @AccountStatus int
+	declare @AccountType int
+	declare @DateActiveUntil datetime
+	declare @BanExpireDate datetime
+	declare @lastgamedate datetime
+	declare @GameServerId int
+	declare @PremiumExpireTime datetime
+	declare @PremiumLastBonus datetime
+	select
+		@AccountStatus=AccountStatus,
+		@AccountType=AccountType,
+		@IsDeveloper=IsDeveloper, 
+		@DateActiveUntil=DateActiveUntil,
+		@BanExpireDate=BanExpireDate,
+		@GameServerId=GameServerId, 
+		@lastgamedate=lastgamedate,
+		@PremiumExpireTime=PremiumExpireTime,
+		@PremiumLastBonus=PremiumLastBonus
+		from UsersData where CustomerID=@CustomerID
+	if(@@ROWCOUNT = 0) begin
+		select
+			5 as LoginResult,
+			@CustomerID as CustomerID,
+			0 as AccountStatus,
+			0 as SessionID,
+			0 as IsDeveloper,
+			0 as SteamUserID
+		return
+	end
+
+	-- status equal to 201 means temporary ban
+	if (@AccountStatus = 201) begin
+		declare @BanExpireMin int = DATEDIFF(mi, GETDATE(), @BanExpireDate)
+		if(@BanExpireMin > 0) begin
+			select
+				3 as LoginResult,
+				@CustomerID as CustomerID,
+				@AccountStatus as AccountStatus,
+				@BanExpireMin as SessionID,
+				0 as IsDeveloper,
+				0 as SteamUserID
+			return
+		end
+		else
+		begin
+			-- unban player
+			set @AccountStatus = 100
+			update dbo.UsersData set AccountStatus=@AccountStatus where CustomerID=@CustomerID
+		end
+	end
+
+	if (@AccountStatus >= 200) begin
+		select
+			3 as LoginResult,
+			@CustomerID as CustomerID,
+			@AccountStatus as AccountStatus,
+			0 as SessionID,
+			0 as IsDeveloper,
+			0 as SteamUserID
+		return
+	end
+
+	-- check if account time expired
+	if(GETDATE() > @DateActiveUntil) begin
+		select
+			4 as LoginResult,
+			@CustomerID as CustomerID,
+			300 as AccountStatus,	-- special 'TimeExpired' code
+			0 as SessionID,
+			0 as IsDeveloper,
+			0 as SteamUserID
+		return
+	end 
+
+	-- security locked (does not apply if login from steam)
+	if(@AccAccountStatus = 102 and @in_IsSteamLogin=0) begin
+		select
+			10 as LoginResult,
+			@CustomerID as CustomerID,
+			102 as AccountStatus,
+			0 as SessionID,
+			@IsDeveloper as IsDeveloper,
+			0 as SteamUserID
+		return
+	end
+	
+	-- do not lock steam logins
+	if(@in_IsSteamLogin = 0)
+	begin
+		declare @out_NeedLock int
+		exec WZ_ACCOUNT_SecurityCheckForLock @CustomerID, @in_IP, @in_Country, @out_NeedLock out
+		if(@out_NeedLock > 0)
+		begin
+			declare @LockToken varchar(32) = ''
+			select @LockToken=token from AccountLocks where CustomerID=@CustomerID and IsUnlocked=0
+
+			select
+				10 as LoginResult,
+				@CustomerID as CustomerID,
+				103 as AccountStatus,	-- 103 is first time lock
+				0 as SessionID,
+				@IsDeveloper as IsDeveloper,
+				0 as SteamUserID,
+				@LockToken as 'LockToken'
+			return
+		end
+	end
+	
+	-- check if game is still active or 90sec passed from last update (COPYPASTE_GAMECHECK, search for others)
+	if(@GameServerId > 0 and DATEDIFF(second, @lastgamedate, GETDATE()) < 120 and @IsDeveloper = 0) begin
+		select
+			0 as LoginResult,
+			@CustomerID as CustomerID,
+			70 as AccountStatus,	-- game still active code
+			0 as SessionID,
+			0 as IsDeveloper,
+			0 as SteamUserID
+		return
+	end
+	
+	-- update session key/id
+	declare @SessionKey varchar(50) = NEWID()
+	declare @SessionID int = checksum(@SessionKey)
+	if exists (SELECT CustomerID FROM LoginSessions WHERE CustomerID = @CustomerID)
+	begin
+		UPDATE LoginSessions SET 
+			SessionKey=@SessionKey, 
+			SessionID=@SessionID,
+			LoginIP=@in_IP, 
+			TimeLogged=GETDATE(), 
+			TimeUpdated=GETDATE()
+		WHERE CustomerID=@CustomerID
+	end
+	else
+	begin
+		INSERT INTO LoginSessions
+			(CustomerID, SessionKey, SessionID, LoginIP, TimeLogged, TimeUpdated)
+		VALUES 
+			(@CustomerID, @SessionKey, @SessionID, @in_IP, GETDATE(), GETDATE())
+	end
+
+	-- update other tables
+	UPDATE Accounts SET 
+		lastlogindate=GETDATE(), 
+		lastloginIP=@in_IP,
+		lastloginCountry=@in_Country
+	WHERE CustomerID=@CustomerID
+	
+	INSERT INTO Logins 
+		(CustomerID, LoginTime, IP, LoginSource, Country) 
+	VALUES 
+		(@CustomerID, GETDATE(), @in_IP, @in_IsSteamLogin, @in_Country)
+
+
+	-- give premium GC bonuses every 24hrs (actually every 23:30)
+	if(@PremiumExpireTime > GETDATE() and DATEDIFF(minute, @PremiumLastBonus, GETDATE()) > 1410) begin
+		exec FN_AlterUserGP @CustomerID, 30, 'Daily Premium Bonus'
+		update UsersData set PremiumLastBonus=GETDATE() where CustomerID=@CustomerID
+	end
+
+	-- get SteamUserID for refunded customer checks
+	declare @SteamUserID bigint = 0
+	select @SteamUserID=SteamUserID from Accounts where CustomerID=@CustomerID
+	
+	-- return session info
+	SELECT 
+		0 as LoginResult,
+		@CustomerID as CustomerID,
+		@AccountStatus as AccountStatus,
+		@SessionID as SessionID,
+		@IsDeveloper as IsDeveloper,
+		@SteamUserID as SteamUserID
+END
+
