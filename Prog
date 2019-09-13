@@ -1,193 +1,138 @@
-ALTER PROCEDURE [dbo].[WZ_ACCOUNT_LOGIN_EXEC]
-	@in_IP varchar(100),
-	@CustomerID int,
-	@in_Country varchar(50)='',
-	@in_IsSteamLogin int = 0
+ALTER PROCEDURE [dbo].[WZ_ACCOUNT_CREATE]
+	@in_IP varchar(64),
+	@in_Email varchar(128),
+	@in_Password varchar(64),
+	@in_ReferralID int,
+	@in_SerialKey varchar(128),
+	@in_SerialEmail varchar(128)
 AS
 BEGIN
 	SET NOCOUNT ON;
 	
 	--
-	-- helper function that perform actual user login
+	-- NOTE: add new ResultCodes to updater CUpdater::CreateAccThreadEntry
 	--
 	
-	-- Account.AccountStatus - used for account lock
-	declare @AccAccountStatus int = 0
-	select @AccAccountStatus=AccountStatus from Accounts where CustomerID=@CustomerID
+
+-- check for serial key
+	--declare @keyResultCode int = 99
+	--declare @keyCustomerID int = 99
+	--declare @keySerialType int = 99
+	--exec [BreezeNet].[dbo].[BN_WarZ_SerialGetInfo]
+		--@in_SerialKey,
+		--@in_SerialEmail,
+		--@keyResultCode out,
+		--@keyCustomerID out,
+		--@keySerialType out
+		
+	--if(@keyResultCode <> 0 or @keyCustomerID > 0) begin
+		--select 3 as ResultCode, 'Serial not valid' as ResultMsg;
+		--return
+	--end
 	
-	-- UsersData data
-	declare @IsDeveloper int = 0
-	declare @AccountStatus int
-	declare @AccountType int
-	declare @DateActiveUntil datetime
-	declare @BanExpireDate datetime
-	declare @lastgamedate datetime
-	declare @GameServerId int
-	declare @PremiumExpireTime datetime
-	declare @PremiumLastBonus datetime
-	select
-		@AccountStatus=AccountStatus,
-		@AccountType=AccountType,
-		@IsDeveloper=IsDeveloper, 
-		@DateActiveUntil=DateActiveUntil,
-		@BanExpireDate=BanExpireDate,
-		@GameServerId=GameServerId, 
-		@lastgamedate=lastgamedate,
-		@PremiumExpireTime=PremiumExpireTime,
-		@PremiumLastBonus=PremiumLastBonus
-		from UsersData where CustomerID=@CustomerID
-	if(@@ROWCOUNT = 0) begin
-		select
-			5 as LoginResult,
-			@CustomerID as CustomerID,
-			0 as AccountStatus,
-			0 as SessionID,
-			0 as IsDeveloper,
-			0 as SteamUserID
-		return
-	end
+	declare @keySerialType int = 2
 
-	-- status equal to 201 means temporary ban
-	if (@AccountStatus = 201) begin
-		declare @BanExpireMin int = DATEDIFF(mi, GETDATE(), @BanExpireDate)
-		if(@BanExpireMin > 0) begin
-			select
-				3 as LoginResult,
-				@CustomerID as CustomerID,
-				@AccountStatus as AccountStatus,
-				@BanExpireMin as SessionID,
-				0 as IsDeveloper,
-				0 as SteamUserID
-			return
-		end
-		else
-		begin
-			-- unban player
-			set @AccountStatus = 100
-			update dbo.UsersData set AccountStatus=@AccountStatus where CustomerID=@CustomerID
-		end
-	end
-
-	if (@AccountStatus >= 200) begin
-		select
-			3 as LoginResult,
-			@CustomerID as CustomerID,
-			@AccountStatus as AccountStatus,
-			0 as SessionID,
-			0 as IsDeveloper,
-			0 as SteamUserID
-		return
-	end
-
-	-- check if account time expired
-	if(GETDATE() > @DateActiveUntil) begin
-		select
-			4 as LoginResult,
-			@CustomerID as CustomerID,
-			300 as AccountStatus,	-- special 'TimeExpired' code
-			0 as SessionID,
-			0 as IsDeveloper,
-			0 as SteamUserID
-		return
-	end 
-
-	-- security locked (does not apply if login from steam)
-	if(@AccAccountStatus = 102 and @in_IsSteamLogin=0) begin
-		select
-			10 as LoginResult,
-			@CustomerID as CustomerID,
-			102 as AccountStatus,
-			0 as SessionID,
-			@IsDeveloper as IsDeveloper,
-			0 as SteamUserID
-		return
+-- check if that account was created and refunded before (status 999)
+	declare @RefundCustomerID int = 0
+	select @RefundCustomerID=CustomerID from Accounts WHERE email=@in_Email and AccountStatus=999
+	if(@RefundCustomerID > 0) begin
+		-- change email to some unique one so it can be used again.
+		declare @dateTime varchar(128)
+		set @dateTime = REPLACE(CONVERT(VARCHAR, GETDATE(),111),'/','') + REPLACE(CONVERT(VARCHAR, GETDATE(),108),':','')
+		declare @refundedEmail varchar(128) = '(' + @dateTime + ') ' + @in_Email
+		update Accounts set email=@refundedEmail where CustomerID=@RefundCustomerID
 	end
 	
-	-- do not lock steam logins
-	if(@in_IsSteamLogin = 0)
-	begin
-		declare @out_NeedLock int
-		exec WZ_ACCOUNT_SecurityCheckForLock @CustomerID, @in_IP, @in_Country, @out_NeedLock out
-		if(@out_NeedLock > 0)
-		begin
-			declare @LockToken varchar(32) = ''
-			select @LockToken=token from AccountLocks where CustomerID=@CustomerID and IsUnlocked=0
-
-			select
-				10 as LoginResult,
-				@CustomerID as CustomerID,
-				103 as AccountStatus,	-- 103 is first time lock
-				0 as SessionID,
-				@IsDeveloper as IsDeveloper,
-				0 as SteamUserID,
-				@LockToken as 'LockToken'
-			return
-		end
+-- validate that email is unique
+	if exists (SELECT CustomerID from Accounts WHERE email=@in_Email) begin
+		select 2 as ResultCode, 'Email already in use' as ResultMsg;
+		return;
 	end
 	
-	-- check if game is still active or 90sec passed from last update (COPYPASTE_GAMECHECK, search for others)
-	if(@GameServerId > 0 and DATEDIFF(second, @lastgamedate, GETDATE()) < 120 and @IsDeveloper = 0) begin
-		select
-			0 as LoginResult,
-			@CustomerID as CustomerID,
-			70 as AccountStatus,	-- game still active code
-			0 as SessionID,
-			0 as IsDeveloper,
-			0 as SteamUserID
-		return
+-- create user
+	declare @MD5FromPwd varchar(100)
+	exec FN_CreateMD5Password @in_Password, @MD5FromPwd OUTPUT
+	INSERT INTO Accounts ( 
+		email,
+		MD5Password,
+		dateregistered,
+		ReferralID,
+		lastlogindate,
+		lastloginIP
+	) VALUES (
+		@in_EMail,
+		@MD5FromPwd,
+		GETDATE(),
+		@in_ReferralID,
+		GETDATE(),
+		@in_IP
+	)
+
+	-- get new CustomerID
+	declare @CustomerID int
+	SELECT @CustomerID=CustomerID from Accounts where email=@in_Email
+
+-- create all needed user tables
+	INSERT INTO UsersData (
+		CustomerID,
+		AccountType,
+		dateregistered
+	) VALUES (
+		@CustomerID,
+		@keySerialType,
+		GETDATE()
+	)
+	
+	if(@keySerialType = 3 or @keySerialType = 50) begin
+		-- guest accounts have 24hrs play time (sync with WZ_ACCOUNT_APPLYKEY also)
+		declare @DateActiveUntil datetime = DATEADD(hour, 24, GETDATE())
+		update UsersData set DateActiveUntil=@DateActiveUntil where CustomerID=@CustomerID
+	end
+	if(@keySerialType = 7) begin
+		-- warinc guest accounts have 7days play time (sync with WZ_ACCOUNT_APPLYKEY also)
+		set @DateActiveUntil = DATEADD(hour, 168, GETDATE())
+		update UsersData set DateActiveUntil=@DateActiveUntil where CustomerID=@CustomerID
 	end
 	
-	-- update session key/id
-	declare @SessionKey varchar(50) = NEWID()
-	declare @SessionID int = checksum(@SessionKey)
-	if exists (SELECT CustomerID FROM LoginSessions WHERE CustomerID = @CustomerID)
-	begin
-		UPDATE LoginSessions SET 
-			SessionKey=@SessionKey, 
-			SessionID=@SessionID,
-			LoginIP=@in_IP, 
-			TimeLogged=GETDATE(), 
-			TimeUpdated=GETDATE()
-		WHERE CustomerID=@CustomerID
-	end
-	else
-	begin
-		INSERT INTO LoginSessions
-			(CustomerID, SessionKey, SessionID, LoginIP, TimeLogged, TimeUpdated)
-		VALUES 
-			(@CustomerID, @SessionKey, @SessionID, @in_IP, GETDATE(), GETDATE())
-	end
+-- register CustomerID in BreezeNet
+	exec [BreezeNet].[dbo].[BN_WarZ_SerialSetCustomerID] @in_SerialKey, @CustomerID
 
-	-- update other tables
-	UPDATE Accounts SET 
-		lastlogindate=GETDATE(), 
-		lastloginIP=@in_IP,
-		lastloginCountry=@in_Country
-	WHERE CustomerID=@CustomerID
+-- default items and bonuses for account types
+
+	exec FN_AddItemToUser @CustomerID, 20174, 2000 -- hero: regular guy
+	exec FN_AddItemToUser @CustomerID, 20184, 2000 -- hero: girl
+
+	-- CBT TEST HEROES
+	--exec FN_AddItemToUser @CustomerID, 20182, 2000
+	--exec FN_AddItemToUser @CustomerID, 20184, 2000
+	--exec FN_AddItemToUser @CustomerID, 20189, 2000
+	--exec FN_AddItemToUser @CustomerID, 20193, 2000
+	--exec FN_AddItemToUser @CustomerID, 20194, 2000
+	--exec FN_AddItemToUser @CustomerID, 20195, 2000
+
+	-- 10 of each
+	--declare @i int = 0
+	--while(@i < 10) begin
+	--	set @i = @i + 1
+
+	--	exec FN_AddItemToUser @CustomerID, 101306, 2000 -- Flashlight
+	--	exec FN_AddItemToUser @CustomerID, 101261, 2000 -- Bandages
+	--	exec FN_AddItemToUser @CustomerID, 101296, 2000 -- Can of Soda
+	--	exec FN_AddItemToUser @CustomerID, 101289, 2000 -- Granola Bar
+	--end
+
+	-- BONUSES for packages
+	exec WZ_ACCOUNT_FN_GiveBonus @CustomerID, @keySerialType
+
+	-- STEAM accounts
+	--if(@keySerialType = 10) begin
+	--	-- basic STEAM account - no bonuses
+	--end
 	
-	INSERT INTO Logins 
-		(CustomerID, LoginTime, IP, LoginSource, Country) 
-	VALUES 
-		(@CustomerID, GETDATE(), @in_IP, @in_IsSteamLogin, @in_Country)
+	-- success
+	select 0 as ResultCode
+	select @CustomerID as CustomerID, @keySerialType as 'AccountType'
 
-
-	-- give premium GC bonuses every 24hrs (actually every 23:30)
-	if(@PremiumExpireTime > GETDATE() and DATEDIFF(minute, @PremiumLastBonus, GETDATE()) > 1410) begin
-		exec FN_AlterUserGP @CustomerID, 30, 'Daily Premium Bonus'
-		update UsersData set PremiumLastBonus=GETDATE() where CustomerID=@CustomerID
-	end
-
-	-- get SteamUserID for refunded customer checks
-	declare @SteamUserID bigint = 0
-	select @SteamUserID=SteamUserID from Accounts where CustomerID=@CustomerID
-	
-	-- return session info
-	SELECT 
-		0 as LoginResult,
-		@CustomerID as CustomerID,
-		@AccountStatus as AccountStatus,
-		@SessionID as SessionID,
-		@IsDeveloper as IsDeveloper,
-		@SteamUserID as SteamUserID
+	return
 END
 
