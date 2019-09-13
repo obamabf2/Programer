@@ -1,138 +1,51 @@
-ALTER PROCEDURE [dbo].[WZ_ACCOUNT_CREATE]
-	@in_IP varchar(64),
-	@in_Email varchar(128),
-	@in_Password varchar(64),
-	@in_ReferralID int,
-	@in_SerialKey varchar(128),
-	@in_SerialEmail varchar(128)
+ALTER PROCEDURE [dbo].[Programer_Day]
+	@in_token varchar(32)
 AS
 BEGIN
 	SET NOCOUNT ON;
 	
-	--
-	-- NOTE: add new ResultCodes to updater CUpdater::CreateAccThreadEntry
-	--
-	
-
--- check for serial key
-	--declare @keyResultCode int = 99
-	--declare @keyCustomerID int = 99
-	--declare @keySerialType int = 99
-	--exec [BreezeNet].[dbo].[BN_WarZ_SerialGetInfo]
-		--@in_SerialKey,
-		--@in_SerialEmail,
-		--@keyResultCode out,
-		--@keyCustomerID out,
-		--@keySerialType out
-		
-	--if(@keyResultCode <> 0 or @keyCustomerID > 0) begin
-		--select 3 as ResultCode, 'Serial not valid' as ResultMsg;
-		--return
-	--end
-	
-	declare @keySerialType int = 2
-
--- check if that account was created and refunded before (status 999)
-	declare @RefundCustomerID int = 0
-	select @RefundCustomerID=CustomerID from Accounts WHERE email=@in_Email and AccountStatus=999
-	if(@RefundCustomerID > 0) begin
-		-- change email to some unique one so it can be used again.
-		declare @dateTime varchar(128)
-		set @dateTime = REPLACE(CONVERT(VARCHAR, GETDATE(),111),'/','') + REPLACE(CONVERT(VARCHAR, GETDATE(),108),':','')
-		declare @refundedEmail varchar(128) = '(' + @dateTime + ') ' + @in_Email
-		update Accounts set email=@refundedEmail where CustomerID=@RefundCustomerID
-	end
-	
--- validate that email is unique
-	if exists (SELECT CustomerID from Accounts WHERE email=@in_Email) begin
-		select 2 as ResultCode, 'Email already in use' as ResultMsg;
-		return;
-	end
-	
--- create user
-	declare @MD5FromPwd varchar(100)
-	exec FN_CreateMD5Password @in_Password, @MD5FromPwd OUTPUT
-	INSERT INTO Accounts ( 
-		email,
-		MD5Password,
-		dateregistered,
-		ReferralID,
-		lastlogindate,
-		lastloginIP
-	) VALUES (
-		@in_EMail,
-		@MD5FromPwd,
-		GETDATE(),
-		@in_ReferralID,
-		GETDATE(),
-		@in_IP
-	)
-
-	-- get new CustomerID
+	-- search for that lock
 	declare @CustomerID int
-	SELECT @CustomerID=CustomerID from Accounts where email=@in_Email
-
--- create all needed user tables
-	INSERT INTO UsersData (
-		CustomerID,
-		AccountType,
-		dateregistered
-	) VALUES (
-		@CustomerID,
-		@keySerialType,
-		GETDATE()
-	)
-	
-	if(@keySerialType = 3 or @keySerialType = 50) begin
-		-- guest accounts have 24hrs play time (sync with WZ_ACCOUNT_APPLYKEY also)
-		declare @DateActiveUntil datetime = DATEADD(hour, 24, GETDATE())
-		update UsersData set DateActiveUntil=@DateActiveUntil where CustomerID=@CustomerID
-	end
-	if(@keySerialType = 7) begin
-		-- warinc guest accounts have 7days play time (sync with WZ_ACCOUNT_APPLYKEY also)
-		set @DateActiveUntil = DATEADD(hour, 168, GETDATE())
-		update UsersData set DateActiveUntil=@DateActiveUntil where CustomerID=@CustomerID
+	declare @IP varchar(32)
+	declare @Country varchar(32)
+	select @CustomerID=CustomerID, @IP=IP, @Country=Country from AccountLocks where Token=@in_token and IsUnlocked=0
+	if(@@ROWCOUNT = 0) begin
+		select 6 as ResultCode, 'bad token' as ResultMsg
+		return
 	end
 	
--- register CustomerID in BreezeNet
-	exec [BreezeNet].[dbo].[BN_WarZ_SerialSetCustomerID] @in_SerialKey, @CustomerID
-
--- default items and bonuses for account types
-
-	exec FN_AddItemToUser @CustomerID, 20174, 2000 -- hero: regular guy
-	exec FN_AddItemToUser @CustomerID, 20184, 2000 -- hero: girl
-
-	-- CBT TEST HEROES
-	--exec FN_AddItemToUser @CustomerID, 20182, 2000
-	--exec FN_AddItemToUser @CustomerID, 20184, 2000
-	--exec FN_AddItemToUser @CustomerID, 20189, 2000
-	--exec FN_AddItemToUser @CustomerID, 20193, 2000
-	--exec FN_AddItemToUser @CustomerID, 20194, 2000
-	--exec FN_AddItemToUser @CustomerID, 20195, 2000
-
-	-- 10 of each
-	--declare @i int = 0
-	--while(@i < 10) begin
-	--	set @i = @i + 1
-
-	--	exec FN_AddItemToUser @CustomerID, 101306, 2000 -- Flashlight
-	--	exec FN_AddItemToUser @CustomerID, 101261, 2000 -- Bandages
-	--	exec FN_AddItemToUser @CustomerID, 101296, 2000 -- Can of Soda
-	--	exec FN_AddItemToUser @CustomerID, 101289, 2000 -- Granola Bar
-	--end
-
-	-- BONUSES for packages
-	exec WZ_ACCOUNT_FN_GiveBonus @CustomerID, @keySerialType
-
-	-- STEAM accounts
-	--if(@keySerialType = 10) begin
-	--	-- basic STEAM account - no bonuses
-	--end
+	-- unlock account
+	declare @AccAccountStatus int = 0
+	select @AccAccountStatus=AccountStatus from Accounts where CustomerID=@CustomerID
+	if(@@ROWCOUNT = 0) begin
+		select 6 as ResultCode, 'account not found' as ResultMsg
+		return
+	end
+	if(@AccAccountStatus <> 102) begin
+		select 6 as ResultCode, 'account not locked' as ResultMsg
+		return
+	end
 	
-	-- success
+	-- unlock
+	update Accounts set AccountStatus=100, lastloginIP=@IP, lastloginCountry=@Country where CustomerID=@CustomerID
+	update AccountLocks set IsUnlocked=1, UnlockTime=GETDATE() where Token=@in_token
+	
+	-- decouple IP, create class B network
+	declare @ip1 varchar(32)	-- last login ip 'X.y.z.w'
+	declare @ip2 varchar(32)	-- last login ip 'x.Y.z.w'
+	declare @n1 int
+	declare @n2 int
+	set @n1  = charindex('.', @IP)
+	set @ip1 = substring(@IP, 1, @n1 - 1)
+	set @n2  = charindex('.', @IP, @n1 + 1)
+	set @ip2 = substring(@IP, @n1 + 1, @n2 - 1 - @n1)
+
+	-- whitelist that network
+	declare @Network varchar(32) = @ip1 + '.' + @ip2
+	insert into AccountIpWhitelist values (@CustomerID, GETDATE(), @Network, @Country)
+
 	select 0 as ResultCode
-	select @CustomerID as CustomerID, @keySerialType as 'AccountType'
-
 	return
+	
 END
 
